@@ -25,8 +25,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
-torch.cuda.set_device(1)
-
 
 def save_obj(obj, name ):
     with open('obj/'+ name + '.pkl', 'wb') as f:
