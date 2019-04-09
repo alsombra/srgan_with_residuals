@@ -6,9 +6,6 @@ from solver import Solver
 import time
 import pickle
 
-DATA_PATH = '/data/antonio/img_align_celeba'
-
-
 import argparse
 import os
 import numpy as np
@@ -22,12 +19,13 @@ from torchvision.utils import save_image, make_grid
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
 
-from models import *
-from datasets import *
+from model import *
 
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+
+torch.cuda.set_device(1)
 
 
 def save_obj(obj, name ):
@@ -49,6 +47,10 @@ def str2bool(v):
 
 def main(config, scope):
     # Create directories if not exist.
+    
+    #os.makedirs("images", exist_ok=True)
+    #os.makedirs("saved_models", exist_ok=True)
+
     if not os.path.exists(config.log_path):
         os.makedirs(config.log_path)
     if not os.path.exists(config.model_save_path):
@@ -67,7 +69,8 @@ def main(config, scope):
         os.makedirs(config.result_path + '/HR_HAT_images')
     if not os.path.exists(config.result_path + '/LR_images_snapshot'):
         os.makedirs(config.result_path + '/LR_images_snapshot')  
-
+    
+    
     # Data loader
     data_loader = get_loader(config.data_path, config)
     
@@ -102,29 +105,25 @@ def main(config, scope):
             
             
 if __name__ == '__main__':
-    
-    torch.cuda.set_device(1)
     parser = argparse.ArgumentParser()
 
     # Model hyper-parameters
-    parser.add_argument('--image_size', type=int, default=40, help='LR image size')  #LR img size
+    parser.add_argument('--image_size', type=int, default=64, help='LR image size')  #LR img size
     parser.add_argument('--num_channels', type=int, default=6)
-    parser.add_argument('--conv_dim', type=int, default=128)
     parser.add_argument('--scale_factor', type=int, default=2)
 
     # Training settings
     parser.add_argument('--total_step', type=int, default=200000)###
     parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--loss_function', type=str, default='l2', choices=['l1', 'l2'])#########
+    parser.add_argument('--residual_loss_function', type=str, default=None, choices=['l1', 'l2'])
+    parser.add_argument('--content_loss_function', type=str, default='l2', choices=['l1', 'l2'])#########
     parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")    
-    parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")    parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
+    parser.add_argument("--beta1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")   
+    parser.add_argument("--beta2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
     parser.add_argument("--decay_epoch", type=int, default=100, help="epoch from which to start lr decay")
-    parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
     parser.add_argument('--num_workers', type=int, default=4)  ########
     parser.add_argument('--trained_model', type=str, default=None) ########## mudei pra receber string
-    parser.add_argument("--hr_height", type=int, default=128, help="high res. image height")
-parser.add_argument("--hr_width", type=int, default=128, help="high res. image width")
+    parser.add_argument('--trained_discriminator', type=str, default=None) ########## mudei pra receber string
 
     # Test
     parser.add_argument('--test_mode', type=str, default='pick_from_set', choices=['single', 'many', 'pick_from_set', 'evaluate'])
@@ -133,6 +132,8 @@ parser.add_argument("--hr_width", type=int, default=128, help="high res. image w
     parser.add_argument('--evaluation_size', type=int, default=10) #if evaluation size == -1 takes all test_set
 
     # Misc
+    parser.add_argument("--dataset_name", type=str, default="img_align_celeba", help="name of the dataset")
+    
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
     
     parser.add_argument('--iteration', type=int, default=0)
@@ -157,7 +158,9 @@ parser.add_argument("--hr_width", type=int, default=128, help="high res. image w
     # Data path
     
     #config.image_path = os.path.join("../data/img_align_celeba/train/")
-  
+   
+    DATA_PATH = "/data/antonio/%s" % config.dataset_name
+
     config.data_path = os.path.join(DATA_PATH, config.mode)##################
     print(config)
     print('-------------------------------------------------------------------------')

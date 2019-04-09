@@ -40,22 +40,22 @@ parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rat
 parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
 parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
 parser.add_argument("--decay_epoch", type=int, default=100, help="epoch from which to start lr decay")
-parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
+parser.add_argument("--num_workers", type=int, default=8, help="number of cpu threads to use during batch generation")
 parser.add_argument("--hr_height", type=int, default=128, help="high res. image height")
 parser.add_argument("--hr_width", type=int, default=128, help="high res. image width")
 parser.add_argument("--channels", type=int, default=3, help="number of image channels")
 parser.add_argument("--sample_interval", type=int, default=500, help="interval between saving image samples")
 parser.add_argument("--checkpoint_interval", type=int, default=1, help="interval between model checkpoints")
-opt = parser.parse_args()
-print(opt)
+config = parser.parse_args()
+print(config)
 
 cuda = torch.cuda.is_available()
 
-hr_shape = (opt.hr_height, opt.hr_width)
+hr_shape = (config.hr_height, config.hr_width)
 
 # Initialize generator and discriminator
 generator = GeneratorResNet()
-discriminator = Discriminator(input_shape=(opt.channels, *hr_shape))
+discriminator = Discriminator(input_shape=(config.channels, *hr_shape))
 feature_extractor = FeatureExtractor()
 
 # Set feature extractor to inference mode
@@ -72,22 +72,22 @@ if cuda:
     criterion_GAN = criterion_GAN.cuda()
     criterion_content = criterion_content.cuda()
 
-if opt.epoch != 0:
+if config.epoch != 0:
     # Load pretrained models
     generator.load_state_dict(torch.load("saved_models/generator_%d.pth"))
     discriminator.load_state_dict(torch.load("saved_models/discriminator_%d.pth"))
 
 # Optimizers
-optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
-optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+optimizer_G = torch.optim.Adam(generator.parameters(), lr=config.lr, betas=(config.b1, config.b2))
+optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=config.lr, betas=(config.b1, config.b2))
 
 Tensor = torch.cuda.FloatTensor if cuda else torch.Tensor
     
 dataloader = DataLoader(
-    ImageDataset("/data/antonio/%s/train" % opt.dataset_name, hr_shape=hr_shape),
-    batch_size=opt.batch_size,
+    ImageDataset("/data/antonio/%s/train" % config.dataset_name, hr_shape=hr_shape),
+    batch_size=config.batch_size,
     shuffle=True,
-    num_workers=opt.n_cpu,
+    num_workers=config.num_workers,
 )
 
 #########################################################################################
@@ -96,7 +96,7 @@ dataloader = DataLoader(
 #  Training
 # ----------
 
-for epoch in range(opt.epoch, opt.n_epochs):
+for epoch in range(config.epoch, config.n_epochs):
     for i, imgs in enumerate(dataloader):
 
         # Configure model input
@@ -152,11 +152,11 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         sys.stdout.write(
             "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
-            % (epoch, opt.n_epochs, i, len(dataloader), loss_D.item(), loss_G.item())
+            % (epoch, config.n_epochs, i, len(dataloader), loss_D.item(), loss_G.item())
         )
         
         batches_done = epoch * len(dataloader) + i
-        if batches_done % opt.sample_interval == 0:
+        if batches_done % config.sample_interval == 0:
             # Save image grid with upsampled inputs and SRGAN outputs
             imgs_lr = nn.functional.interpolate(imgs_lr, scale_factor=2)
             gen_hr = make_grid(gen_hr, nrow=1, normalize=True)
@@ -164,7 +164,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
             img_grid = torch.cat((imgs_lr, gen_hr), -1)
             save_image(img_grid, "images/%d.png" % batches_done, normalize=False)
 
-    if opt.checkpoint_interval != -1 and epoch % opt.checkpoint_interval == 0:
+    if config.checkpoint_interval != -1 and epoch % config.checkpoint_interval == 0:
         # Save model checkpoints
         torch.save(generator.state_dict(), "saved_models/generator_%d.pth" % epoch)
         torch.save(discriminator.state_dict(), "saved_models/discriminator_%d.pth" % epoch)

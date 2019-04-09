@@ -3,14 +3,14 @@ import torch.nn as nn
 import os
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
-from model import SRMD
+from model import *
 import numpy as np
 from data_loader import Scaling, Scaling01, ImageFolder, random_downscale
 from utils import Kernels, load_kernels
 from PIL import Image,ImageDraw
 
 
-torch.set_default_tensor_type(torch.DoubleTensor)
+torch.set_default_tensor_type(torch.FloatTensor)
 
 
 class Solver(object):
@@ -20,18 +20,18 @@ class Solver(object):
         self.data_iter = iter(self.data_loader)
 
         # Model hyper-parameters
-        self.num_blocks = config.num_blocks  # num_blocks = 11
         self.num_channels = config.num_channels  # num_channels = 6
-        self.conv_dim = config.conv_dim # conv_dim = 128
         self.scale_factor = config.scale_factor  # scale_factor = 2
 
         # Training settings
         self.total_step = config.total_step # 50000
-        self.loss_function = config.loss_function
+        self.content_loss_function = config.content_loss_function
+        self.residual_loss_function = config.residual_loss_function
         self.lr = config.lr 
         self.beta1 = config.beta1 # 0.5  ????????????????? testar 0.9 ou 0.001
         self.beta2 = config.beta2 # 0.99  ???????????????
         self.trained_model = config.trained_model
+        self.trained_discriminator = config.trained_discriminator
         self.use_tensorboard = config.use_tensorboard
         self.start_step = -1
         
@@ -53,53 +53,83 @@ class Solver(object):
         self.device = config.device
 
         # Initialize model
-        self.build_model() 
+        self.hr_shape = (config.image_size * self.scale_factor, config.image_size * self.scale_factor)
+
+        self.build_model(config) 
         
         if self.use_tensorboard:
             self.build_tensorboard()
 
         # Start with trained model
         if self.trained_model:
-            self.load_trained_model()
+            self.load('generator')
+            print('loaded trained model (step: {})..!'.format(self.trained_model.split('.')[0])) 
+            
+        if self.trained_discriminator:
+            self.load('discriminator')
+            print('loaded trained discriminator (step: {})..!'.format(self.trained_discriminator.split('.')[0])) 
 
-    def build_model(self):
+    def build_model(self, config):
         # model and optimizer
-        self.model = SRMD(self.num_blocks, self.num_channels, self.conv_dim, self.scale_factor)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), self.lr, [self.beta1, self.beta2])
-
-        self.model.to(self.device)
-
-    def load_trained_model(self):
-        self.load(os.path.join(self.model_save_path, '{}'.format(self.trained_model)))
-        print('loaded trained model (step: {})..!'.format(self.trained_model.split('.')[0])) 
-
-    def load(self, filename):
-        S = torch.load(filename)
-        self.model.load_state_dict(S['SR'])
-        try:
-            self.optimizer.load_state_dict(S['optimizer_state_dict'])
-        except KeyError as error:
-            print('There is no '+str(error)+' in loaded model. Loading model without optimizer_params')
-        try:
-            self.start_step = S['epoch'] - 1
-        except KeyError as error:
-            print('There is no '+str(error)+' in loaded model. Loading model without epoch info')
+        self.model = GeneratorResNet(in_channels=self.num_channels)  #OBS: model = generator
+        self.discriminator = Discriminator(input_shape=(3, *self.hr_shape)) # 3 channels residual - RGB 
+        self.feature_extractor = FeatureExtractor()
+        # Set feature extractor to inference mode
+        self.feature_extractor.eval()
+    
+        # Optimizers
+        self.optimizer_G = torch.optim.Adam(self.model.parameters(), self.lr, [self.beta1, self.beta2])
+        self.optimizer_D = torch.optim.Adam(self.discriminator.parameters(), self.lr, [self.beta1, self.beta2])
         
-    #############################################
-    def build_tensorboard(self):
-        pass
-    ######################################################
+        self.model.to(self.device)
+        self.discriminator.to(self.device)
+        self.feature_extractor.to(self.device)
+
+    def load(self, type_of_net):
+        if type_of_net == 'generator':
+            filename = os.path.join(self.model_save_path, '{}'.format(self.trained_model))
+            S = torch.load(filename)
+            self.model.load_state_dict(S['SR'])
+            try:
+                self.optimizer_G.load_state_dict(S['optimizer_state_dict'])                       
+            except KeyError as error:
+                print('There is no '+str(error)+' in loaded model. Loading model without optimizer_params')
+            try:
+                self.start_step = S['epoch'] - 1
+            except KeyError as error:
+                print('There is no '+str(error)+' in loaded model. Loading model without epoch info')
+        if type_of_net=='discriminator':
+            filename = os.path.join(self.model_save_path, '{}'.format(self.trained_discriminator))
+            S = torch.load(filename)
+            self.discriminator.load_state_dict(S['SR'])
+            try:
+                self.optimizer_D.load_state_dict(S['optimizer_state_dict'])  
+            except KeyError as error:
+                print('There is no '+str(error)+' in loaded model. Loading model without optimizer_params')
+
     def update_lr(self, lr):
-        for param_group in self.optimizer.param_groups:
+        for param_group in self.optimizer_G.param_groups:
             param_group['lr'] = lr
 
-    def reset_grad(self):
-        self.optimizer.zero_grad()
-    ######################################################################
     def detach(self, x):  # NOT USED. To learn more SEE https://pytorch.org/blog/pytorch-0_4_0-migration-guide/
         return x.data
     #############################################################
     
+    def get_hr_hat_from_resid(self, lr_images, reconsts):
+        tmp1 = lr_images.data.cpu().numpy().transpose(0,2,3,1)*255
+        image_list = [np.array(Image.fromarray(tmp1.astype(np.uint8)[i]).resize((128,128), Image.BICUBIC)) for i in range(len(lr_images))]
+        images_hr_bicubic= np.stack(image_list)
+        #return this ^
+        images_hr_bicubic = images_hr_bicubic.transpose(0,3,1,2)
+        images_hr_bicubic = Scaling(images_hr_bicubic)
+        images_hr_bicubic = torch.from_numpy(images_hr_bicubic).float().to(self.device) # NUMPY to TORCH
+        hr_images_hat = reconsts + images_hr_bicubic
+        hr_images_hat = hr_images_hat.data.cpu().numpy()
+        hr_images_hat = Scaling01(hr_images_hat)
+        hr_images_hat = torch.from_numpy(hr_images_hat).float().to(self.device) # NUMPY to TORCH
+
+        return hr_images_hat
+        
     
     def get_trio_images(self, lr_image,hr_image, reconst):
         tmp1 = lr_image.data.cpu().numpy().transpose(0,2,3,1)*255
@@ -110,7 +140,7 @@ class Solver(object):
         #return this ^
         image_hr_bicubic = image_hr_bicubic.transpose(0,3,1,2)
         image_hr_bicubic = Scaling(image_hr_bicubic)
-        image_hr_bicubic = torch.from_numpy(image_hr_bicubic).double().to(self.device) # NUMPY to TORCH
+        image_hr_bicubic = torch.from_numpy(image_hr_bicubic).float().to(self.device) # NUMPY to TORCH
         hr_image_hat = reconst + image_hr_bicubic
         hr_image_hat = hr_image_hat.data.cpu().numpy()
         hr_image_hat = Scaling01(hr_image_hat)
@@ -132,12 +162,12 @@ class Solver(object):
         image_list = [np.array(Image.fromarray(tmp1.astype(np.uint8)[i]).resize((128,128), Image.BICUBIC)) for i in range(self.data_loader.batch_size)]
         image_hr_bicubic= np.stack(image_list).transpose(0,3,1,2)
         image_hr_bicubic = Scaling(image_hr_bicubic)
-        image_hr_bicubic = torch.from_numpy(image_hr_bicubic).double().to(self.device) # NUMPY to TORCH
+        image_hr_bicubic = torch.from_numpy(image_hr_bicubic).float().to(self.device) # NUMPY to TORCH
         hr_image_hat = reconst + image_hr_bicubic
                 
         hr_image_hat = hr_image_hat.data.cpu().numpy()
         hr_image_hat = Scaling01(hr_image_hat)
-        hr_image_hat = torch.from_numpy(hr_image_hat).double().to(self.device) # NUMPY to TORCH
+        hr_image_hat = torch.from_numpy(hr_image_hat).float().to(self.device) # NUMPY to TORCH
 
         pairs = torch.cat((image_hr_bicubic.data, \
                                 hr_image_hat.data,\
@@ -147,15 +177,15 @@ class Solver(object):
         grid = (255 * tmp).astype(np.uint8)
         return grid
     
-    def img_add_info(self, img_paths, img, epoch, loss):
+    def img_add_info(self, img_paths, img, step, loss):
         'receives tensor as img'
         added_text = Image.new('RGB', (500, img.shape[0]), color = 'white')
         d = ImageDraw.Draw(added_text)
-        d.text((10,10), "model trained for {} epochs, loss (comparing residuals): {:.4f}".format(epoch, loss.item()) + \
+        d.text((10,10), "model trained for {} steps, loss G: (comparing residuals): {:.4f}".format(step, loss.item()) + \
                "\n" + '\n'.join([os.path.basename(path) for path in img_paths]), fill='black')
         imgs_comb = np.hstack((np.array(img), added_text))
         
-        d.text((10,10), "model trained for {} epochs, loss (comparing residuals): {:.4f}".format(epoch, loss.item()), fill='black')
+        d.text((10,10), "model trained for {} steps, loss G: (comparing residuals): {:.4f}".format(step, loss.item()), fill='black')
         
         imgs_comb = Image.fromarray(imgs_comb)
         return imgs_comb    
@@ -163,12 +193,27 @@ class Solver(object):
 
     def train(self):
         self.model.train()
+        self.discriminator.train()
+        
+        
+#         cuda = torch.cuda.is_available()    
+#         Tensor = torch.cuda.FloatTensor if cuda else torch.Tensor    
+    
+            # GANs Loss 
+        criterion_GAN = nn.MSELoss()
 
-        # Reconstruction Loss 
-        if self.loss_function == 'l1':
-            reconst_loss = nn.L1Loss()
-        elif self.loss_function == 'l2':
-            reconst_loss = nn.MSELoss()
+        # Residual Loss
+        if self.residual_loss_function == 'l1':
+            criterion_resid = nn.L1Loss()
+        if self.residual_loss_function == 'l2':
+            criterion_resid = nn.MSELoss()
+                
+        # Content Loss
+        if self.content_loss_function == 'l1':
+            criterion_content = nn.L1Loss()
+        elif self.content_loss_function == 'l2':
+            criterion_content = nn.MSELoss()
+
 
         # Data iter
         data_iter = iter(self.data_loader)
@@ -176,7 +221,7 @@ class Solver(object):
         
         #Initialize steps
         start = self.start_step + 1 # if not loading trained start = 0     
-
+                    
         for step in range(self.start_step, self.total_step):
             
             self.model.train() # adicionei pq o cara no fim (p/ samples) colocou modo eval() e esqueceu de voltar
@@ -184,33 +229,85 @@ class Solver(object):
             # Reset data_iter for each epoch  
             if (step+1) % iter_per_epoch == 0:     
                 data_iter = iter(self.data_loader)  
+            
+            img_paths, lr_images, hr_images, x, y = next(data_iter)
+            lr_images, hr_images, x, y = lr_images.to(self.device), hr_images.to(self.device), x.to(self.device), y.to(self.device)
 
-            img_paths, lr_image, hr_image, x, y = next(data_iter)
-            lr_image, hr_image, x, y = lr_image.to(self.device), hr_image.to(self.device), x.to(self.device), y.to(self.device)
 
-            y = y.to(torch.float64)
-
+            # Adversarial ground truths
+            valid = np.ones((lr_images.size(0), *self.discriminator.output_shape))
+            valid = torch.from_numpy(valid).float().to(self.device)
+            fake = np.zeros((lr_images.size(0), *self.discriminator.output_shape))
+            fake = torch.from_numpy(fake).float().to(self.device)
+               
+            # ------------------
+            #  Train Generators
+            # ------------------
+            self.optimizer_G.zero_grad()
+            
             out = self.model(x)
-            loss = reconst_loss(out, y)
+            
+            # Adversarial Loss
+            loss_GAN = criterion_GAN(self.discriminator(out), valid)
+            
+            #Residual loss
+            if self.residual_loss_function !=None:
+                loss_resid = criterion_resid(out, y)
 
-            self.reset_grad()
+            # Content Loss
+            #------ get h_hat from out ----
+            
+            if self.content_loss_function !=None:
+                hr_hats = self.get_hr_hat_from_resid(lr_images, out)
 
+                gen_features = self.feature_extractor(hr_hats) #########
+                real_features = self.feature_extractor(hr_images)
+                loss_content = criterion_content(gen_features, real_features.detach())
+
+                # Total loss loss_G = 1e-3*loss_GAN + loss_content + loss_resid
+            loss_G = 1e-3 * loss_GAN
+            
+            if self.content_loss_function != None:
+                loss_G = loss_G + loss_content 
+            if self.residual_loss_function != None:
+                loss_G = loss_G + loss_resid
+            
             # For decoder
-            loss.backward(retain_graph=True)
+            loss_G.backward()
 
-            self.optimizer.step()
+            self.optimizer_G.step()
+
+            # ---------------------
+            #  Train Discriminator
+            # ---------------------
+ 
+            self.optimizer_D.zero_grad()
+            # Loss of real and fake *RESIDUAL* images
+            
+            loss_real = criterion_GAN(self.discriminator(y), valid)
+            loss_fake = criterion_GAN(self.discriminator(out.detach()), fake)
+
+            # Total loss
+            loss_D = (loss_real + loss_fake) / 2
+        
+            loss_D.backward()
+            self.optimizer_D.step()
+
+            # --------------
+            #  Log Progress
+            # --------------
 
             # Print out log info
             if (step+1) % self.log_step == 0:
-                print("[{}/{}] loss: {:.5f}".format(step+1, self.total_step, loss.item()))
+                print("[{}/{}] [D loss: {:.5f}] [G loss: {:.5f}]".format(step+1, self.total_step, loss_D.item(), loss_G.item()))
 
               # Sample images
 
             if (step+1) % self.sample_step == 0:
                 self.model.eval()
                 reconst = self.model(x)
-                tmp = self.create_grid(lr_image,hr_image, reconst)
-                imgs_comb = self.img_add_info(img_paths, tmp, step+1, loss)                
+                tmp = self.create_grid(lr_images,hr_images, reconst)
+                imgs_comb = self.img_add_info(img_paths, tmp, step+1, loss_G)                
                 #from IPython.display import display
                 grid_PIL = imgs_comb
                 grid_PIL.save('./samples/test_{}.jpg'.format(step + 1))
@@ -225,48 +322,109 @@ class Solver(object):
                     hr.save('./samples/test_{}_hr.png'.format(step + 1))
 
             # Save check points
-            if (step+1) % self.model_save_step == 0: #name format: batch_size + loss function + image type + epoch           
-                self.save(step+1, loss.item(), os.path.join(self.model_save_path, '{}.pth.tar'.format(str(self.data_loader.batch_size) + '_' + self.loss_function.upper() + '_' + str(step+1))))
+            if (step+1) % self.model_save_step == 0:                
+                self.save('generator', step+1, loss_G.item(), os.path.join(self.model_save_path, '{}.pth.tar'.format(str(step+1) + '_cont_'+str(self.content_loss_function).upper() + '_resid_' + str(self.residual_loss_function).upper() + '_GEN_' + '_loss_gen_' + "%.3f" % loss_G.item() + '_loss_disc_'+ "%.3f" % loss_D.item())))
+                self.save('discriminator', step+1, loss_D.item(), os.path.join(self.model_save_path, '{}.pth.tar'.format(str(step+1) + '_cont_'+str(self.content_loss_function).upper() + '_resid_' + str(self.residual_loss_function).upper() + '_DISC_'+ '_loss_gen_' + "%.3f" % loss_G.item() + '_loss_disc_'+ "%.3f" % loss_D.item())))
 
-    def save(self, step, current_loss, filename):
-        model = self.model.state_dict()
-        torch.save({
-            'epoch': step+1,
-            'SR': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'loss': str(current_loss)
-            }, filename)
+
+    def save(self, type_of_net, step, current_loss, filename):
+        if type_of_net == 'generator':
+            torch.save({
+                'epoch': step+1,
+                'SR': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer_G.state_dict(),
+                'loss': str(current_loss)
+                }, filename)
+        elif type_of_net == 'discriminator':
+            torch.save({
+                'epoch': step+1,
+                'SR': self.discriminator.state_dict(),
+                'optimizer_state_dict': self.optimizer_D.state_dict(),
+                'loss': str(current_loss)
+                }, filename)
 
     def test_and_error(self): #receives batch from dataloader
         'You run it for a random batch from test_set. You can change batch_size for len(test_set)'
         self.model.eval()
-        epoch = self.start_step + 1 # if not loading trained start = 0 
-             # Reconst loss
-        reconst_loss = nn.MSELoss()
+        step = self.start_step + 1 # if not loading trained start = 0 
+            
+        # GANs Loss 
+        criterion_GAN = nn.MSELoss()
 
-            # Data iter
-        img_paths, lr_image, hr_image, x, y = next(self.data_iter)
-        lr_image, hr_image, x, y = lr_image.to(self.device), hr_image.to(self.device), x.to(self.device), y.to(self.device)
+        # Residual Loss
+        if self.residual_loss_function == 'l1':
+            criterion_resid = nn.L1Loss()
+        if self.residual_loss_function == 'l2':
+            criterion_resid = nn.MSELoss()
+                
+        # Content Loss
+        if self.content_loss_function == 'l1':
+            criterion_content = nn.L1Loss()
+        elif self.content_loss_function == 'l2':
+            criterion_content = nn.MSELoss()
 
-        y = y.to(torch.float64)
+        # Data iter
+        img_paths, lr_images, hr_images, x, y = next(self.data_iter)
+        lr_images, hr_images, x, y = lr_images.to(self.device), hr_images.to(self.device), x.to(self.device), y.to(self.device)
 
-        reconst = self.model(x)
-        loss = reconst_loss(reconst, y)
 
-        # Print out log info 
-        print("model trained for {} epochs, loss: {:.4f}".format(self.start_step, loss.item()))
+        # Adversarial ground truths
+        valid = np.ones((lr_images.size(0), *self.discriminator.output_shape))
+        valid = torch.from_numpy(valid).float().to(self.device)
+        fake = np.zeros((lr_images.size(0), *self.discriminator.output_shape))
+        fake = torch.from_numpy(fake).float().to(self.device)
         
-        tmp = self.create_grid(lr_image, hr_image, reconst)
-        grid_PIL = self.img_add_info(img_paths, tmp, epoch, loss)
+    
+        out = self.model(x)
+            
+        # Adversarial Loss
+        loss_GAN = criterion_GAN(self.discriminator(out), valid)
+            
+        #Residual loss
+        if self.residual_loss_function !=None:
+            loss_resid = criterion_resid(out, y)
+
+        # Content Loss
+        #------ get h_hat from out ----
+            
+        if self.content_loss_function !=None:
+            hr_hats = self.get_hr_hat_from_resid(lr_images, out)
+
+            gen_features = self.feature_extractor(hr_hats) #########
+            real_features = self.feature_extractor(hr_images)
+            loss_content = criterion_content(gen_features, real_features.detach())
+
+        # Total loss loss_G = 1e-3*loss_GAN + loss_content + loss_resid
+        loss_G = 1e-3 * loss_GAN
+            
+        if self.content_loss_function != None:
+            loss_G = loss_G + loss_content 
+        if self.residual_loss_function != None:
+            loss_G = loss_G + loss_resid
+
+        #Discriminator LOSS
+            
+        loss_real = criterion_GAN(self.discriminator(y), valid)
+        loss_fake = criterion_GAN(self.discriminator(out.detach()), fake)
+
+        # Total loss
+        loss_D = (loss_real + loss_fake) / 2
+
+        # Print out log info
+        if (step+1) % self.log_step == 0:
+            print("Model trained for {} steps, [D loss: {:.5f}] [G loss: {:.5f}]".format(step+1, loss_D.item(), loss_G.item()))
+        
+        tmp = self.create_grid(lr_images, hr_images, out)
+        grid_PIL = self.img_add_info(img_paths, tmp, step, loss_G)
         random_number = np.random.rand(1)[0]
         if self.data_loader.batch_size > 1:
-            grid_PIL.save('./test_results/{:.3f}_grid_{}.png'.format(random_number, self.start_step + 1))
+            grid_PIL.save('./test_results/multi_pics_{:.3f}_grid_{}.png'.format(random_number, self.start_step + 1))
             
         elif self.data_loader.batch_size == 1: #only saves separate images if batch == 1
             grid_PIL.save('./results/grids/'+ os.path.basename(img_paths[0])+'_grid_{}.png'.format(self.start_step + 1))
-            hr_bic, hr_hat, hr = self.get_trio_images(lr_image,hr_image, reconst)
+            hr_bic, hr_hat, hr = self.get_trio_images(lr_images,hr_images, out)
 
-            lr_image_np = lr_image.data.cpu().numpy().transpose(0,2,3,1)*255
+            lr_image_np = lr_images.data.cpu().numpy().transpose(0,2,3,1)*255
             lr_image_np = Image.fromarray(np.squeeze(lr_image_np).astype(np.uint8))
 
             lr_image_np.save('./results/LR_images_snapshot/'+ os.path.basename(img_paths[0])+'_lr_{}.png'.format(self.start_step + 1))
@@ -331,10 +489,9 @@ class Solver(object):
         lr_image_with_resid = lr_image_with_resid.unsqueeze(0) #just add one dimension (index on batch)
         lr_image_scaled = lr_image_scaled.unsqueeze(0)
 
-        lr_image, x = lr_image_scaled.to(torch.float64), lr_image_with_resid.to(torch.float64) 
+        lr_image, x = lr_image_scaled, lr_image_with_resid 
         lr_image, x = lr_image.to(self.device), x.to(self.device)
 
-        x = x.to(torch.float64)
 
         reconst = self.model(x)
 
@@ -346,7 +503,7 @@ class Solver(object):
         #return this ^
         image_hr_bicubic = image_hr_bicubic.transpose(0,3,1,2)
         image_hr_bicubic = Scaling(image_hr_bicubic)
-        image_hr_bicubic = torch.from_numpy(image_hr_bicubic).double().to(self.device) # NUMPY to TORCH
+        image_hr_bicubic = torch.from_numpy(image_hr_bicubic).float().to(self.device) # NUMPY to TORCH
         hr_image_hat = reconst + image_hr_bicubic
         hr_image_hat_np = hr_image_hat.data.cpu().numpy()
         hr_image_hat_np_scaled = Scaling01(hr_image_hat_np)
@@ -360,7 +517,7 @@ class Solver(object):
 
         #Create Grid
         hr_image_hat_np_scaled = Scaling01(hr_image_hat_np)
-        hr_image_hat_torch = torch.from_numpy(hr_image_hat_np_scaled).double().to(self.device) # NUMPY to TORCH
+        hr_image_hat_torch = torch.from_numpy(hr_image_hat_np_scaled).float().to(self.device) # NUMPY to TORCH
 
         pairs = torch.cat((image_hr_bicubic.data, \
                         hr_image_hat_torch.data), dim=3)
@@ -372,6 +529,7 @@ class Solver(object):
 
         
     def many_tests(self):
+        '''Pass just image_folder_path via --test_image_path and it will test for all pictures in the folder'''
         import glob
         TYPES = ('*.png', '*.jpg', '*.jpeg', '*.bmp')
         image_paths = []

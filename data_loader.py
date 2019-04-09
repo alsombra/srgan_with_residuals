@@ -9,7 +9,7 @@ from utils import Kernels, load_kernels
 
 TYPES = ('*.png', '*.jpg', '*.jpeg', '*.bmp')
 
-torch.set_default_tensor_type(torch.DoubleTensor)
+torch.set_default_tensor_type(torch.FloatTensor)
 
 
 def Scaling(image):
@@ -25,11 +25,21 @@ def random_downscale(image, scale_factor):
     return downscaled_image
 
 class ImageFolder(data.Dataset):
-    """Custom Dataset compatible with prebuilt DataLoader."""
+    def __init__(self, root, config=None):
+        self.device = config.device
+        self.image_paths = sorted(glob.glob(root + "/*.*"))
+        self.image_size = config.image_size
+        self.scale_factor = config.scale_factor
+        hr_height, hr_width = config.image_size * config.scale_factor, config.image_size * config.scale_factor
+        K, P = load_kernels(file_path='kernels/', scale_factor=self.scale_factor)
+        #K = kernels -> K.shape = (15,15,1,358)
+        #P = Matriz de projeçao do PCA --> P.shape = (15,225)
+        self.randkern = Kernels(K, P)
+        # Transforms for low resolution images and high resolution images
 
     def __getitem__(self, index):
         """Read an image from a file and preprocesses it and returns."""
-        image_path = self.image_paths[index]
+        image_path = self.image_paths[index % len(self.image_paths)]
         image = Image.open(image_path)
         if np.array(image).shape==4:
             image = np.array(image)[:,:,:3]
@@ -100,10 +110,10 @@ class ImageFolder(data.Dataset):
         hr_residual_scaled = hr_residual_scaled.permute(2,0,1)
         
         return image_path,\
-                lr_image_scaled.to(torch.float64),\
-                hr_image_scaled.to(torch.float64), \
-                lr_image_with_resid.to(torch.float64), \
-                hr_residual_scaled.to(torch.float64)
+                lr_image_scaled,\
+                hr_image_scaled, \
+                lr_image_with_resid, \
+                hr_residual_scaled
 
     def __len__(self):
         """Return the total number of image files."""
